@@ -1,0 +1,452 @@
+---
+- name: Setup Environment and Deploy PostgreSQL with SSL/TLS to Ubuntu Server
+  hosts: postgres-server
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    deploy_path:              "{{ lookup('env', 'ANSIBLE_DEPLOY_PATH') }}"
+    postgres_user:            "{{ lookup('env', 'MY_POSTGRES_USER') }}"
+    postgres_password:        "{{ lookup('env', 'MY_POSTGRES_PASSWORD') }}"
+    postgres_database:        "{{ lookup('env', 'MY_POSTGRES_DATABASE') }}"
+    postgres_domain:          "{{ lookup('env', 'MY_POSTGRES_HOST') }}"
+    postgres_host_port:       "{{ lookup('env', 'MY_POSTGRES_HOST_PORT') }}"
+    postgres_container_port:  "{{ lookup('env', 'MY_POSTGRES_CONTAINER_PORT') }}"
+    postgres_container_name:  "{{ lookup('env', 'MY_POSTGRES_CONTAINER_NAME') }}"
+    postgres_volume_name:     "{{ lookup('env', 'MY_POSTGRES_VOLUME_NAME') }}"
+    postgres_network_name:    "{{ lookup('env', 'MY_POSTGRES_NETWORK_NAME') }}"
+  
+  tasks:
+    # =================================================================
+    # DETECT SERVER RESOURCES AND CALCULATE OPTIMAL POSTGRESQL SETTINGS
+    # =================================================================
+    
+    - name: Gather system facts
+      setup:
+        gather_subset:
+          - hardware
+    
+    - name: Display detected server resources
+      debug:
+        msg:
+          - "Detected CPU cores:    {{ ansible_processor_vcpus }}"
+          - "Detected RAM:          {{ (ansible_memtotal_mb / 1024) | round(1) }}GB"
+          - "Detected architecture: {{ ansible_architecture }}"
+    
+    - name: Calculate optimal PostgreSQL settings
+      set_fact:
+        # CPU calculations (use 87.5% of available cores, minimum 2)
+        total_cpus:                   "{{ ansible_processor_vcpus | int }}"
+        postgres_cpus:                "{{ [(ansible_processor_vcpus | int * 0.875) | round(0, 'ceil') | int, 2] | max }}"
+        # CPU reservation (50% of available cores for container reservations, minimum 1)
+        postgres_cpus_reserved:       "{{ [(ansible_processor_vcpus | int * 0.5) | round(0, 'ceil') | int, 1] | max }}"
+        
+        # Memory calculations (total RAM in MB)
+        total_memory_mb:              "{{ ansible_memtotal_mb | int }}"
+        total_memory_gb:              "{{ (ansible_memtotal_mb / 1024) | round(1) }}"
+        
+        # Docker container limits (75% of RAM - leave headroom for OS and other processes)
+        postgres_memory_mb:           "{{ (ansible_memtotal_mb * 0.75) | int }}"
+        # Docker memory reservation (37.5% of total RAM = 50% of container limit)
+        postgres_memory_reserved_mb:  "{{ (ansible_memtotal_mb * 0.375) | int }}"
+        
+        # PostgreSQL shared_buffers (25% of total RAM, max 16GB for optimal performance)
+        # Beyond 16GB shows diminishing returns and increases checkpoint/recovery time
+        # CRITICAL: Must not exceed 40% of container memory limit to avoid OOM
+        shared_buffers_mb:            "{{ [[(ansible_memtotal_mb * 0.25) | int, 16384, (ansible_memtotal_mb * 0.75 * 0.4) | int] | min, 256] | max }}"
+        
+        # PostgreSQL effective_cache_size (hint to query planner for available cache)
+        # Use 50% for <16GB RAM (conservative), 66% for >=16GB RAM (more dedicated)
+        effective_cache_mb:           "{{ (ansible_memtotal_mb * (0.5 if ansible_memtotal_mb < 16384 else 0.66)) | int }}"
+        
+        # PostgreSQL max_connections (scales with RAM but considers connection overhead)
+        # Formula: min(RAM_GB * 25, 400) - more conservative for production stability
+        # Each connection uses ~10MB base + work_mem when active
+        max_connections:              "{{ [[((ansible_memtotal_mb / 1024) * 25) | int, 400] | min, 20] | max }}"
+        
+        # PostgreSQL maintenance_work_mem (for VACUUM, CREATE INDEX, ALTER TABLE)
+        # 5% of RAM, min 256MB, max 2GB for <32GB RAM, max 4GB for >=32GB RAM
+        maintenance_work_mem_mb:      "{{ [[(ansible_memtotal_mb * 0.05) | int, (2048 if ansible_memtotal_mb < 32768 else 4096)] | min, 256] | max }}"
+        
+        # Shared memory size (1/3 of container memory)
+        shm_size_mb:                  "{{ (ansible_memtotal_mb * 0.75 / 3) | int }}"
+        
+        # max_wal_size: Controls checkpoint frequency (larger = less frequent checkpoints)
+        # RAM / 4, min 1GB, max 8GB for <32GB RAM, max 16GB for >=32GB RAM
+        max_wal_size_mb:              "{{ [[(ansible_memtotal_mb / 4) | int, (8192 if ansible_memtotal_mb < 32768 else 16384)] | min, 1024] | max }}"
+        
+        # Query tracking settings
+        # track_activity_query_size: 2KB base + scale with RAM (max 16KB)
+        track_activity_query_size:    "{{ [[(ansible_memtotal_mb / 8) | int, 16384] | min, 2048] | max }}"
+        
+        # Storage optimization - assume SSD for modern servers (can be overridden)
+        # random_page_cost: 4.0 for HDD, 1.1 for SSD/NVMe
+        random_page_cost:             "1.1"
+    
+    - name: Calculate derived settings (depend on previous calculations)
+      set_fact:
+        # WAL settings (scale with shared_buffers)
+        # wal_buffers: 1/32 of shared_buffers, min 1MB, max 16MB (beyond this has no benefit)
+        # PostgreSQL recommendation: -1 (auto) or 1/32 of shared_buffers, capped at 16MB
+        wal_buffers_mb:               "{{ [[(shared_buffers_mb | int / 32) | int, 16] | min, 1] | max }}"
+        
+        # min_wal_size: 25% of max_wal_size
+        min_wal_size_mb:              "{{ (max_wal_size_mb | int / 4) | int }}"
+        
+        # PostgreSQL work_mem (per query operation memory)
+        # Formula: (Total RAM * 0.25) / max_connections / 3, between 1MB-512MB
+        # Division by 3 accounts for multiple operations per query (sorts, hash joins, etc.)
+        work_mem_mb:                  "{{ [[(total_memory_mb | int * 0.25 / max_connections | int / 3) | int, 512] | min, 1] | max }}"
+        
+        # pg_stat_statements.max: Tracks distinct normalized queries
+        # Formula: max_connections * 50 (50 unique queries per connection), max 10K
+        pg_stat_statements_max:       "{{ [[(max_connections | int * 50), 10000] | min, 5000] | max }}"
+    
+    - name: Calculate CPU-based parallelism settings
+      set_fact:
+        # max_worker_processes = 87.5% of CPUs
+        max_worker_processes:         "{{ postgres_cpus }}"
+        
+        # max_parallel_workers = same as max_worker_processes
+        max_parallel_workers:         "{{ postgres_cpus }}"
+        
+        # max_parallel_workers_per_gather = min(4, max(2, cpus/4))
+        max_parallel_workers_per_gather: "{{ [[(postgres_cpus | int / 4) | round(0, 'ceil') | int, 2] | max, 4] | min }}"
+        
+        # max_parallel_maintenance_workers = min(4, max(2, cpus/4))
+        max_parallel_maintenance_workers: "{{ [[(postgres_cpus | int / 4) | round(0, 'ceil') | int, 2] | max, 4] | min }}"
+        
+        # autovacuum_max_workers = min(4, max(2, cpus/4))
+        # Production needs sufficient workers to prevent table bloat
+        autovacuum_max_workers:       "{{ [[(postgres_cpus | int / 4) | round(0, 'ceil') | int, 2] | max, 4] | min }}"
+    
+    - name: Display calculated PostgreSQL settings
+      debug:
+        msg:
+          - "=== Calculated PostgreSQL Configuration ==="
+          - "Container Resources:"
+          - "  - CPUs: {{ postgres_cpus }} cores ({{ (postgres_cpus | int * 100 / total_cpus | int) | round }}% of {{ total_cpus }})"
+          - "  - Memory Limit: {{ (postgres_memory_mb / 1024) | round(1) }}GB ({{ (postgres_memory_mb * 100 / total_memory_mb) | round }}% of {{ total_memory_gb }}GB)"
+          - "  - Memory Reserved: {{ (postgres_memory_reserved_mb / 1024) | round(1) }}GB"
+          - "  - Shared Memory: {{ (shm_size_mb / 1024) | round(1) }}GB"
+          - "PostgreSQL Connections:"
+          - "  - max_connections: {{ max_connections }}"
+          - "PostgreSQL Memory:"
+          - "  - shared_buffers: {{ (shared_buffers_mb / 1024) | round(1) }}GB"
+          - "  - effective_cache_size: {{ (effective_cache_mb / 1024) | round(1) }}GB"
+          - "  - work_mem: {{ work_mem_mb }}MB"
+          - "  - maintenance_work_mem: {{ (maintenance_work_mem_mb / 1024) | round(1) }}GB"
+          - "PostgreSQL WAL:"
+          - "  - wal_buffers: {{ wal_buffers_mb }}MB"
+          - "  - max_wal_size: {{ (max_wal_size_mb / 1024) | round(1) }}GB"
+          - "  - min_wal_size: {{ (min_wal_size_mb / 1024) | round(1) }}GB"
+          - "PostgreSQL Parallelism:"
+          - "  - max_worker_processes: {{ max_worker_processes }}"
+          - "  - max_parallel_workers: {{ max_parallel_workers }}"
+          - "  - max_parallel_workers_per_gather: {{ max_parallel_workers_per_gather }}"
+          - "  - max_parallel_maintenance_workers: {{ max_parallel_maintenance_workers }}"
+          - "  - autovacuum_max_workers: {{ autovacuum_max_workers }}"
+          - "PostgreSQL Query Tracking:"
+          - "  - track_activity_query_size: {{ (track_activity_query_size / 1024) | round(1) }}KB"
+          - "  - pg_stat_statements.max: {{ pg_stat_statements_max }}"
+    
+    # ==================
+    # SETUP ENVIRONMENT
+    # ==================
+    
+    - name: Check if Docker is already installed
+      command: docker --version
+      register: docker_installed
+      changed_when: false
+      failed_when: false
+      
+    - name: Display Docker installation status
+      debug:
+        msg: "Docker is {{ 'already installed' if docker_installed.rc == 0 else 'not installed, will install now' }}"
+    
+    - name: Update apt package index
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: docker_installed.rc != 0
+      
+    - name: Install prerequisites for Docker
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+      when: docker_installed.rc != 0
+      
+    - name: Create directory for Docker GPG key
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+      when: docker_installed.rc != 0
+      
+    - name: Add Docker GPG key
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+      when: docker_installed.rc != 0
+      
+    - name: Add Docker repository
+      shell: |
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+      when: docker_installed.rc != 0
+      
+    - name: Update apt package index after adding Docker repo
+      apt:
+        update_cache: yes
+      when: docker_installed.rc != 0
+      
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+      when: docker_installed.rc != 0
+      
+    - name: Ensure Docker service is running
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+        
+    - name: Add ansible user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+      when: docker_installed.rc != 0
+        
+    - name: Verify Docker is working
+      command: docker run --rm hello-world
+      register: docker_test
+      changed_when: false
+    
+    - name: Check if UFW is installed
+      command: ufw status
+      register: ufw_check
+      changed_when: false
+      failed_when: false
+      
+    - name: Install UFW if not present
+      apt:
+        name: ufw
+        state: present
+      when: ufw_check.rc != 0
+              
+    - name: Configure UFW to allow PostgreSQL port
+      ufw:
+        rule: allow
+        port: "{{ postgres_host_port }}"
+        proto: tcp
+        comment: 'PostgreSQL access'
+        
+    - name: Enable UFW
+      ufw:
+        state: enabled
+    
+    # ==================
+    # DEPLOY POSTGRESQL
+    # ==================
+    
+    - name: Ensure deployment directory exists
+      file:
+        path: "{{ deploy_path }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        
+    - name: Create subdirectories
+      file:
+        path: "{{ deploy_path }}/{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      loop:
+        - docker
+        - certs
+        
+    - name: Copy SSL certificates
+      copy:
+        src: "{{ playbook_dir }}/../certs/{{ item.src }}"
+        dest: "{{ deploy_path }}/certs/{{ item.dest }}"
+        mode: "{{ item.mode }}"
+        owner: "999"
+        group: "999"
+      loop:
+        - { src: 'combined_cert.pem', dest: 'combined_cert.pem', mode: '0644' }
+        - { src: 'privkey.pem', dest: 'privkey.pem', mode: '0600' }
+        
+    - name: Copy Dockerfile
+      copy:
+        src: "{{ playbook_dir }}/../docker/Dockerfile"
+        dest: "{{ deploy_path }}/docker/Dockerfile"
+        mode: '0644'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        
+    - name: Generate optimized postgresql.conf from template
+      template:
+        src: "{{ playbook_dir }}/../docker/postgresql.conf"
+        dest: "{{ deploy_path }}/docker/postgresql.conf"
+        mode: '0644'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      vars:
+        POSTGRES_PORT: "{{ postgres_container_port }}"
+        MAX_CONNECTIONS: "{{ max_connections }}"
+        SHARED_BUFFERS: "{{ shared_buffers_mb }}MB"
+        EFFECTIVE_CACHE_SIZE: "{{ effective_cache_mb }}MB"
+        WORK_MEM: "{{ work_mem_mb }}MB"
+        MAINTENANCE_WORK_MEM: "{{ maintenance_work_mem_mb }}MB"
+        WAL_BUFFERS: "{{ wal_buffers_mb }}MB"
+        MAX_WAL_SIZE: "{{ max_wal_size_mb }}MB"
+        MIN_WAL_SIZE: "{{ min_wal_size_mb }}MB"
+        MAX_WORKER_PROCESSES: "{{ max_worker_processes }}"
+        MAX_PARALLEL_WORKERS: "{{ max_parallel_workers }}"
+        MAX_PARALLEL_WORKERS_PER_GATHER: "{{ max_parallel_workers_per_gather }}"
+        MAX_PARALLEL_MAINTENANCE_WORKERS: "{{ max_parallel_maintenance_workers }}"
+        AUTOVACUUM_MAX_WORKERS: "{{ autovacuum_max_workers }}"
+        TRACK_ACTIVITY_QUERY_SIZE: "{{ track_activity_query_size }}"
+        PG_STAT_STATEMENTS_MAX: "{{ pg_stat_statements_max }}"
+        RANDOM_PAGE_COST: "{{ random_page_cost }}"
+        
+    - name: Template docker-compose.yml with parametrized volume and network names
+      template:
+        src: "{{ playbook_dir }}/../docker-compose.yml.j2"
+        dest: "{{ deploy_path }}/docker-compose.yml"
+        mode: '0644'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        
+    - name: Create .env file for Docker Compose
+      copy:
+        content: |
+          MY_POSTGRES_IMAGE_NAME={{ postgres_container_name }}-image
+          MY_POSTGRES_USER={{ postgres_user }}
+          MY_POSTGRES_PASSWORD={{ postgres_password }}
+          MY_POSTGRES_DATABASE={{ postgres_database }}
+          MY_POSTGRES_CPUS={{ postgres_cpus }}
+          MY_POSTGRES_MEMORY={{ postgres_memory_mb }}M
+          MY_POSTGRES_CPUS_RESERVED={{ postgres_cpus_reserved }}
+          MY_POSTGRES_MEMORY_RESERVED={{ postgres_memory_reserved_mb }}M
+          MY_POSTGRES_SHM_SIZE={{ shm_size_mb }}M
+          MY_POSTGRES_CONTAINER_NAME={{ postgres_container_name }}
+          MY_POSTGRES_VOLUME_NAME={{ postgres_volume_name }}
+          MY_POSTGRES_NETWORK_NAME={{ postgres_network_name }}
+          MY_POSTGRES_HOST_PORT={{ postgres_host_port }}
+          MY_POSTGRES_CONTAINER_PORT={{ postgres_container_port }}
+        dest: "{{ deploy_path }}/.env"
+        mode: '0600'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        
+    - name: Stop existing PostgreSQL container if running
+      shell: |
+        cd {{ deploy_path }}
+        docker compose down || true
+      become_user: "{{ ansible_user }}"
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+      
+    - name: Ensure certificate directory exists with correct permissions
+      file:
+        path: "{{ deploy_path }}/certs"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+    
+    - name: Build PostgreSQL Docker image with SSL
+      shell: |
+        cd {{ deploy_path }}
+        docker compose build
+      become_user: "{{ ansible_user }}"
+      args:
+        executable: /bin/bash
+        
+    - name: Start PostgreSQL container
+      shell: |
+        cd {{ deploy_path }}
+        docker compose up -d
+      become_user: "{{ ansible_user }}"
+      args:
+        executable: /bin/bash
+    
+    - name: Wait for container to initialize
+      pause:
+        seconds: 5
+    
+    - name: Check container status
+      shell: docker ps -a --filter name={{ postgres_container_name }} --format "{{ '{{' }}.Status{{ '}}' }}"
+      register: container_state
+      changed_when: false
+      ignore_errors: yes
+    
+    - name: Get container logs if not running
+      shell: docker logs {{ postgres_container_name }} 2>&1 | tail -50
+      register: container_logs
+      when: container_state.stdout is defined and 'Up' not in container_state.stdout
+      changed_when: false
+      ignore_errors: yes
+    
+    - name: Display container logs
+      debug:
+        msg: "{{ container_logs.stdout_lines | default([]) }}"
+      when: container_state.stdout is defined and 'Up' not in container_state.stdout
+    
+    - name: Fail if container is not running
+      fail:
+        msg: "PostgreSQL container is not running. Status: {{ container_state.stdout | default('unknown') }}. Check logs above."
+      when: container_state.stdout is defined and 'Up' not in container_state.stdout
+        
+    - name: Wait for PostgreSQL to be ready
+      shell: |
+        docker exec {{ postgres_container_name }} pg_isready -U {{ postgres_user }} -d {{ postgres_database }}
+      register: pg_ready
+      retries: 10
+      delay: 3
+      until: pg_ready.rc == 0
+      changed_when: false
+          
+    - name: Verify SSL is enabled
+      shell: |
+        docker exec {{ postgres_container_name }} psql -U {{ postgres_user }} -d {{ postgres_database }} -c "SHOW ssl;"
+      register: ssl_status
+      changed_when: false
+      
+    - name: Get container status
+      shell: |
+        docker ps --filter name={{ postgres_container_name }} --format "table {{ '{{' }}.Names{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}\t{{ '{{' }}.Ports{{ '}}' }}"
+      register: container_status
+      changed_when: false
+      
+    - name: Display deployment results
+      debug:
+        msg:
+          - "✅ PostgreSQL Deployment: SUCCESS"
+          - "🐘 PostgreSQL SSL Status: {{ ssl_status.stdout_lines[2] if ssl_status.stdout_lines|length > 2 else 'Unknown' }}"
+          - "🐳 Container Status: {{ container_status.stdout_lines[1] if container_status.stdout_lines|length > 1 else 'Running' }}"
+          - "🔐 Database: {{ postgres_database }}"
+          - "👤 User: {{ postgres_user }}"
+          - "🌐 Domain: {{ postgres_domain }}"
+          # - "📊 Migrations: {{ (migration_result.results | selectattr('rc', 'equalto', 0) | list | length) ~ '/' ~ (migration_result.results | length) ~ ' completed successfully' if migration_result is defined else 'Not configured' }}"
+          - "📍 Connection: postgresql://{{ postgres_user }}:PASSWORD@{{ postgres_domain }}:{{ postgres_host_port }}/{{ postgres_database }}?sslmode=require"
+          - "⚠️ Security Note: SSL/TLS encryption is ENABLED and REQUIRED for connections"

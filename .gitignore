@@ -1,0 +1,6 @@
+**/.env.prod
+**/.env.dev
+
+**/*.pem
+
+**/.gh.*
