@@ -67,8 +67,9 @@ function deploy_postgres_with_ansible() {
     trap 'shred -u /tmp/ansible_ssh_key 2>/dev/null || true' EXIT
 
     # Run Ansible playbook
-    run ansible-playbook deploy-postgres.yml
-    
+    #run ansible-playbook deploy-postgres.yml
+    ansible-playbook deploy-postgres.yml
+
     cd - >/dev/null 2>&1
     
     log_info "Deploy PostgreSQL with Ansible completed successfully."

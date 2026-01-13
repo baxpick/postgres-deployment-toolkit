@@ -13,6 +13,7 @@
     postgres_host_port:       "{{ lookup('env', 'MY_POSTGRES_HOST_PORT') }}"
     postgres_container_port:  "{{ lookup('env', 'MY_POSTGRES_CONTAINER_PORT') }}"
     postgres_container_name:  "{{ lookup('env', 'MY_POSTGRES_CONTAINER_NAME') }}"
+    postgres_image_name:      "{{ lookup('env', 'MY_POSTGRES_IMAGE_NAME') }}"
     postgres_volume_name:     "{{ lookup('env', 'MY_POSTGRES_VOLUME_NAME') }}"
     postgres_network_name:    "{{ lookup('env', 'MY_POSTGRES_NETWORK_NAME') }}"
   
@@ -150,6 +151,40 @@
           - "  - track_activity_query_size: {{ (track_activity_query_size / 1024) | round(1) }}KB"
           - "  - pg_stat_statements.max: {{ pg_stat_statements_max }}"
     
+    # ================================
+    # CHECK IF DEPLOYMENT IS REQUIRED
+    # ================================
+    
+    - name: Check if container is already running
+      shell: docker inspect {{ postgres_container_name }} --format='{{ '{{' }}.State.Running{{ '}}' }}' 2>/dev/null || echo "false"
+      register: container_running
+      changed_when: false
+      failed_when: false
+      
+    - name: Check current container image version
+      shell: docker inspect {{ postgres_container_name }} --format='{{ '{{' }}.Config.Image{{ '}}' }}' 2>/dev/null || echo ""
+      register: current_image
+      changed_when: false
+      failed_when: false
+      when: container_running.stdout == "true"
+      
+    - name: Determine if deployment should be skipped
+      set_fact:
+        skip_deployment: "{{ container_running.stdout == 'true' and current_image.stdout == postgres_image_name }}"
+    
+    - name: Display deployment decision
+      debug:
+        msg: |
+          {% if skip_deployment %}
+          ✅ PostgreSQL container '{{ postgres_container_name }}' is already running with image '{{ postgres_image_name }}'
+          ⏭️  Skipping deployment - no changes needed
+          {% else %}
+          🔄 Deployment required:
+            - Container running: {{ container_running.stdout }}
+            - Current image: {{ current_image.stdout | default('N/A') }}
+            - Target image: {{ postgres_image_name }}
+          {% endif %}
+    
     # ==================
     # SETUP ENVIRONMENT
     # ==================
@@ -159,16 +194,18 @@
       register: docker_installed
       changed_when: false
       failed_when: false
+      when: not skip_deployment
       
     - name: Display Docker installation status
       debug:
         msg: "Docker is {{ 'already installed' if docker_installed.rc == 0 else 'not installed, will install now' }}"
+      when: not skip_deployment
     
     - name: Update apt package index
       apt:
         update_cache: yes
         cache_valid_time: 3600
-      when: docker_installed.rc != 0
+      when: not skip_deployment and docker_installed.rc != 0
       
     - name: Install prerequisites for Docker
       apt:
@@ -178,14 +215,14 @@
           - gnupg
           - lsb-release
         state: present
-      when: docker_installed.rc != 0
+      when: not skip_deployment and docker_installed.rc != 0
       
     - name: Create directory for Docker GPG key
       file:
         path: /etc/apt/keyrings
         state: directory
         mode: '0755'
-      when: docker_installed.rc != 0
+      when: not skip_deployment and docker_installed.rc != 0
       
     - name: Add Docker GPG key
       shell: |
@@ -193,19 +230,19 @@
         chmod a+r /etc/apt/keyrings/docker.gpg
       args:
         creates: /etc/apt/keyrings/docker.gpg
-      when: docker_installed.rc != 0
+      when: not skip_deployment and docker_installed.rc != 0
       
     - name: Add Docker repository
       shell: |
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
       args:
         creates: /etc/apt/sources.list.d/docker.list
-      when: docker_installed.rc != 0
+      when: not skip_deployment and docker_installed.rc != 0
       
     - name: Update apt package index after adding Docker repo
       apt:
         update_cache: yes
-      when: docker_installed.rc != 0
+      when: not skip_deployment and docker_installed.rc != 0
       
     - name: Install Docker
       apt:
@@ -216,37 +253,40 @@
           - docker-buildx-plugin
           - docker-compose-plugin
         state: present
-      when: docker_installed.rc != 0
+      when: not skip_deployment and docker_installed.rc != 0
       
     - name: Ensure Docker service is running
       systemd:
         name: docker
         state: started
         enabled: yes
+      when: not skip_deployment
         
     - name: Add ansible user to docker group
       user:
         name: "{{ ansible_user }}"
         groups: docker
         append: yes
-      when: docker_installed.rc != 0
+      when: not skip_deployment and docker_installed.rc != 0
         
     - name: Verify Docker is working
       command: docker run --rm hello-world
       register: docker_test
       changed_when: false
+      when: not skip_deployment
     
     - name: Check if UFW is installed
       command: ufw status
       register: ufw_check
       changed_when: false
       failed_when: false
+      when: not skip_deployment
       
     - name: Install UFW if not present
       apt:
         name: ufw
         state: present
-      when: ufw_check.rc != 0
+      when: not skip_deployment and ufw_check.rc != 0
               
     - name: Configure UFW to allow PostgreSQL port
       ufw:
@@ -254,10 +294,12 @@
         port: "{{ postgres_host_port }}"
         proto: tcp
         comment: 'PostgreSQL access'
+      when: not skip_deployment
         
     - name: Enable UFW
       ufw:
         state: enabled
+      when: not skip_deployment
     
     # ==================
     # DEPLOY POSTGRESQL
@@ -270,6 +312,7 @@
         mode: '0755'
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
+      when: not skip_deployment
         
     - name: Create subdirectories
       file:
@@ -281,6 +324,7 @@
       loop:
         - docker
         - certs
+      when: not skip_deployment
         
     - name: Copy SSL certificates
       copy:
@@ -292,6 +336,7 @@
       loop:
         - { src: 'combined_cert.pem', dest: 'combined_cert.pem', mode: '0644' }
         - { src: 'privkey.pem', dest: 'privkey.pem', mode: '0600' }
+      when: not skip_deployment
         
     - name: Copy Dockerfile
       copy:
@@ -300,6 +345,7 @@
         mode: '0644'
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
+      when: not skip_deployment
         
     - name: Generate optimized postgresql.conf from template
       template:
@@ -326,6 +372,7 @@
         TRACK_ACTIVITY_QUERY_SIZE: "{{ track_activity_query_size }}"
         PG_STAT_STATEMENTS_MAX: "{{ pg_stat_statements_max }}"
         RANDOM_PAGE_COST: "{{ random_page_cost }}"
+      when: not skip_deployment
         
     - name: Template docker-compose.yml with parametrized volume and network names
       template:
@@ -334,11 +381,12 @@
         mode: '0644'
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
+      when: not skip_deployment
         
     - name: Create .env file for Docker Compose
       copy:
         content: |
-          MY_POSTGRES_IMAGE_NAME={{ postgres_container_name }}-image
+          MY_POSTGRES_IMAGE_NAME={{ postgres_image_name }}
           MY_POSTGRES_USER={{ postgres_user }}
           MY_POSTGRES_PASSWORD={{ postgres_password }}
           MY_POSTGRES_DATABASE={{ postgres_database }}
@@ -356,6 +404,7 @@
         mode: '0600'
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
+      when: not skip_deployment
         
     - name: Stop existing PostgreSQL container if running
       shell: |
@@ -365,6 +414,7 @@
       args:
         executable: /bin/bash
       ignore_errors: yes
+      when: not skip_deployment
       
     - name: Ensure certificate directory exists with correct permissions
       file:
@@ -373,6 +423,7 @@
         mode: '0755'
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
+      when: not skip_deployment
     
     - name: Build PostgreSQL Docker image with SSL
       shell: |
@@ -381,6 +432,7 @@
       become_user: "{{ ansible_user }}"
       args:
         executable: /bin/bash
+      when: not skip_deployment
         
     - name: Start PostgreSQL container
       shell: |
@@ -389,54 +441,60 @@
       become_user: "{{ ansible_user }}"
       args:
         executable: /bin/bash
+      when: not skip_deployment
     
     - name: Wait for container to initialize
       pause:
         seconds: 5
+      when: not skip_deployment
     
     - name: Check container status
       shell: docker ps -a --filter name={{ postgres_container_name }} --format "{{ '{{' }}.Status{{ '}}' }}"
       register: container_state
       changed_when: false
       ignore_errors: yes
+      when: not skip_deployment
     
     - name: Get container logs if not running
       shell: docker logs {{ postgres_container_name }} 2>&1 | tail -50
       register: container_logs
-      when: container_state.stdout is defined and 'Up' not in container_state.stdout
+      when: not skip_deployment and container_state.stdout is defined and 'Up' not in container_state.stdout
       changed_when: false
       ignore_errors: yes
     
     - name: Display container logs
       debug:
         msg: "{{ container_logs.stdout_lines | default([]) }}"
-      when: container_state.stdout is defined and 'Up' not in container_state.stdout
+      when: not skip_deployment and container_state.stdout is defined and 'Up' not in container_state.stdout
     
     - name: Fail if container is not running
       fail:
         msg: "PostgreSQL container is not running. Status: {{ container_state.stdout | default('unknown') }}. Check logs above."
-      when: container_state.stdout is defined and 'Up' not in container_state.stdout
+      when: not skip_deployment and container_state.stdout is defined and 'Up' not in container_state.stdout
         
     - name: Wait for PostgreSQL to be ready
       shell: |
-        docker exec {{ postgres_container_name }} pg_isready -U {{ postgres_user }} -d {{ postgres_database }}
+        docker exec {{ postgres_container_name }} pg_isready -U {{ postgres_user }} -d {{ postgres_database }} -p {{ postgres_container_port }}
       register: pg_ready
       retries: 10
       delay: 3
       until: pg_ready.rc == 0
       changed_when: false
+      when: not skip_deployment
           
     - name: Verify SSL is enabled
       shell: |
-        docker exec {{ postgres_container_name }} psql -U {{ postgres_user }} -d {{ postgres_database }} -c "SHOW ssl;"
+        docker exec {{ postgres_container_name }} psql -U {{ postgres_user }} -d {{ postgres_database }} -p {{ postgres_container_port }} -c "SHOW ssl;"
       register: ssl_status
       changed_when: false
+      when: not skip_deployment
       
     - name: Get container status
       shell: |
         docker ps --filter name={{ postgres_container_name }} --format "table {{ '{{' }}.Names{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}\t{{ '{{' }}.Ports{{ '}}' }}"
       register: container_status
       changed_when: false
+      when: not skip_deployment
       
     - name: Display deployment results
       debug:
@@ -447,6 +505,6 @@
           - "🔐 Database: {{ postgres_database }}"
           - "👤 User: {{ postgres_user }}"
           - "🌐 Domain: {{ postgres_domain }}"
-          # - "📊 Migrations: {{ (migration_result.results | selectattr('rc', 'equalto', 0) | list | length) ~ '/' ~ (migration_result.results | length) ~ ' completed successfully' if migration_result is defined else 'Not configured' }}"
           - "📍 Connection: postgresql://{{ postgres_user }}:PASSWORD@{{ postgres_domain }}:{{ postgres_host_port }}/{{ postgres_database }}?sslmode=require"
           - "⚠️ Security Note: SSL/TLS encryption is ENABLED and REQUIRED for connections"
+      when: not skip_deployment
