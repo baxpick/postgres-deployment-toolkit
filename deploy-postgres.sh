@@ -5,9 +5,9 @@
 
 FOLDER_bash=$(pwd)/bash
 source "${FOLDER_bash}/logging.sh" || { echo "ERROR: Failed to source logging.sh" >&2; exit 1; }
-source "${FOLDER_bash}/azure.sh" || { echo "ERROR: Failed to source azure.sh"; exit 1; }
-source "${FOLDER_bash}/ansible.sh" || { echo "ERROR: Failed to source ansible.sh"; exit 1; }
-source "${FOLDER_bash}/system.sh" || { echo "ERROR: Failed to source system.sh"; exit 1; }
+source "${FOLDER_bash}/azure.sh" || { echo "ERROR: Failed to source azure.sh" >&2; exit 1; }
+source "${FOLDER_bash}/ansible.sh" || { echo "ERROR: Failed to source ansible.sh" >&2; exit 1; }
+source "${FOLDER_bash}/system.sh" || { echo "ERROR: Failed to source system.sh" >&2; exit 1; }
 
 # sanity check
 function sanity_check() {
