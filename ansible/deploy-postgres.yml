@@ -168,21 +168,55 @@
       failed_when: false
       when: container_running.stdout == "true"
       
+    - name: Get remote certificate checksum
+      shell: sha256sum {{ deploy_path }}/certs/combined_cert.pem 2>/dev/null | awk '{print $1}' || echo ""
+      register: remote_cert_checksum
+      changed_when: false
+      failed_when: false
+      when: container_running.stdout == "true"
+      
+    - name: Get remote private key checksum
+      shell: sha256sum {{ deploy_path }}/certs/privkey.pem 2>/dev/null | awk '{print $1}' || echo ""
+      register: remote_key_checksum
+      changed_when: false
+      failed_when: false
+      when: container_running.stdout == "true"
+      
+    - name: Get local certificate checksum
+      local_action: shell sha256sum {{ playbook_dir }}/../certs/combined_cert.pem | awk '{print $1}'
+      register: local_cert_checksum
+      changed_when: false
+      when: container_running.stdout == "true"
+      
+    - name: Get local private key checksum
+      local_action: shell sha256sum {{ playbook_dir }}/../certs/privkey.pem | awk '{print $1}'
+      register: local_key_checksum
+      changed_when: false
+      when: container_running.stdout == "true"
+      
     - name: Determine if deployment should be skipped
       set_fact:
-        skip_deployment: "{{ container_running.stdout == 'true' and current_image.stdout == postgres_image_name }}"
+        skip_deployment: "{{ 
+          container_running.stdout == 'true' and 
+          current_image.stdout == postgres_image_name and
+          remote_cert_checksum.stdout == local_cert_checksum.stdout and
+          remote_key_checksum.stdout == local_key_checksum.stdout
+        }}"
     
     - name: Display deployment decision
       debug:
         msg: |
           {% if skip_deployment %}
           ✅ PostgreSQL container '{{ postgres_container_name }}' is already running with image '{{ postgres_image_name }}'
+          ✅ SSL certificates match (no updates detected)
           ⏭️  Skipping deployment - no changes needed
           {% else %}
           🔄 Deployment required:
             - Container running: {{ container_running.stdout }}
             - Current image: {{ current_image.stdout | default('N/A') }}
             - Target image: {{ postgres_image_name }}
+            - Cert match: {{ (remote_cert_checksum.stdout == local_cert_checksum.stdout) if container_running.stdout == 'true' else 'N/A' }}
+            - Key match: {{ (remote_key_checksum.stdout == local_key_checksum.stdout) if container_running.stdout == 'true' else 'N/A' }}
           {% endif %}
     
     # ==================
