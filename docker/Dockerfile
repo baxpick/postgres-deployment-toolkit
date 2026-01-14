@@ -13,3 +13,13 @@ COPY docker/postgresql.conf /etc/postgresql/postgresql.conf
 
 # Set proper permissions for configuration file
 RUN chmod 644 /etc/postgresql/postgresql.conf
+
+# Accept build-time argument for custom PostgreSQL port
+ARG POSTGRES_PORT=5432
+ENV POSTGRES_PORT=${POSTGRES_PORT}
+
+# Expose the custom port (overrides base image's EXPOSE 5432)
+EXPOSE ${POSTGRES_PORT}
+
+# Override default command to use custom config
+CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]

@@ -13,23 +13,29 @@ source "${FOLDER_bash}/system.sh" || { echo "ERROR: Failed to source system.sh" 
 function sanity_check() {
 
     local REQUIRED_VARS=(
-        LOG_VERBOSE
         ARM_CLIENT_ID
         ARM_CLIENT_CERT_PATH
         ARM_CLIENT_CERT_BASE64
         ARM_TENANT_ID
         ARM_SUBSCRIPTION_ID
-
+        AZURE_KEYVAULT_NAME
+        AZURE_CERT_NAME
+        AZURE_KEY_NAME
         ANSIBLE_USER
         ANSIBLE_PORT
         ANSIBLE_SSH_KEY_BASE64
         ANSIBLE_DEPLOY_PATH
-
         MY_POSTGRES_HOST
         MY_POSTGRES_HOST_IP
-        MY_POSTGRES_DATABASE
         MY_POSTGRES_USER
         MY_POSTGRES_PASSWORD
+        MY_POSTGRES_DATABASE
+        MY_POSTGRES_IMAGE_NAME
+        MY_POSTGRES_CONTAINER_NAME
+        MY_POSTGRES_VOLUME_NAME
+        MY_POSTGRES_NETWORK_NAME
+        MY_POSTGRES_HOST_PORT
+        MY_POSTGRES_CONTAINER_PORT
     )
 
     local missing_vars=()

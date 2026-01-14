@@ -4,6 +4,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        POSTGRES_PORT: ${MY_POSTGRES_CONTAINER_PORT}
     container_name: ${MY_POSTGRES_CONTAINER_NAME}
     environment:
       POSTGRES_USER: ${MY_POSTGRES_USER}
