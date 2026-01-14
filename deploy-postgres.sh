@@ -60,7 +60,7 @@ function deploy_postgres_with_ansible() {
         --vaultName "${AZURE_KEYVAULT_NAME}" \
         --certName "${AZURE_CERT_NAME}" \
         --keyName "${AZURE_KEY_NAME}" \
-        --certsDirOutput $(pwd)/certs
+        --certsDirOutput $(pwd)/certs || exit $?
 
     cd ansible >/dev/null 2>&1
     
@@ -73,8 +73,7 @@ function deploy_postgres_with_ansible() {
     trap 'shred -u /tmp/ansible_ssh_key 2>/dev/null || true' EXIT
 
     # Run Ansible playbook
-    #run ansible-playbook deploy-postgres.yml
-    ansible-playbook deploy-postgres.yml
+    ansible-playbook deploy-postgres.yml || exit $?
 
     cd - >/dev/null 2>&1
     
