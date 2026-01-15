@@ -16,7 +16,7 @@ if [ -f "${FILE_secrets}" ]; then
     cp "${FILE_secrets}" ~/.devcontainer_env
     # REMARK: set -a and set +a are used to export all variables in the file so that subshells can access them
     grep -q "devcontainer_env" ~/.bashrc || echo 'if [ -f ~/.devcontainer_env ]; then set -a; source ~/.devcontainer_env; set +a; fi' >> ~/.bashrc
-    set -a; source ~/.devcontainer_env; set +a
+    set -a; . ~/.devcontainer_env; set +a
 else
     echo "No secrets file found for environment: ${ENVIRONMENT}"
     
